@@ -1,0 +1,131 @@
+#------------------------
+#导入
+from sksurv.svm import FastSurvivalSVM
+from sksurv.metrics import concordance_index_censored
+from sklearn.model_selection import train_test_split
+import pandas as pd
+import numpy as np
+
+#------------------------
+#导入文件
+file_path = r'C:\Users\dong\Desktop\dataanalysis\test\selectdataimp.csv'
+survdata = pd.read_csv(file_path)
+print(survdata.head())
+print(survdata.dtypes)
+print(survdata['statues'].value_counts())
+
+#---------------------
+#分割数据集
+import sklearn
+import numpy as np
+X = survdata.drop(['statues', 'time2'], axis=1)
+y_time = survdata['time2']
+y_event = survdata['statues']
+X_train, X_test, y_time_train, y_time_test, y_event_train, y_event_test = train_test_split(
+    X, y_time, y_event,
+    test_size=0.3,
+    random_state=42,
+    stratify=y_event  # 按是否发生事件分层抽样
+)
+
+
+
+#----------------------------
+#筛选变量-分割数据集
+file_path = r'C:\Users\dong\Desktop\dataanalysis\test\selectdataimp.csv'
+survdata = pd.read_csv(file_path) 
+  
+# 筛选指定的9个特征  
+feature_columns = ['Diagnosticdelay','FrequentFalls', 'PathologicalSigns',   
+                    'AOscore', 'NLR', 'AidWalking', 'Pscore','VB9','statues', 'time2']  
+top9 = survdata[feature_columns]
+print(top9.head())
+X = top9.drop(['statues', 'time2'], axis=1)
+y_time =  top9['time2']
+y_event =  top9['statues']
+X_train, X_test, y_time_train, y_time_test, y_event_train, y_event_test = train_test_split(
+    X, y_time, y_event,
+    test_size=0.3,
+    random_state=42,
+    stratify=y_event)  # 按是否发生事件分层抽样
+
+
+# 组合为 dataframe（后面交叉验证中容易处理）
+y_train = pd.DataFrame({'time': y_time_train, 'event': y_event_train})
+y_test = pd.DataFrame({'time': y_time_test, 'event': y_event_test})
+
+print(f"X_train shape: {X_train.shape}")  
+print(f"X_test shape: {X_test.shape}")  
+print(f"y_train shape: {y_train.shape}")  
+print(f"y_test shape: {y_test.shape}")
+
+
+
+#---------------------
+#optuna自动寻参
+import optuna
+from sklearn.model_selection import KFold
+# 将 y_train 转换为结构化数组
+y_train_struct = np.array([(e, t) for e, t in zip(y_train['event'], y_train['time'])],
+                          dtype=[('event', 'bool'), ('time', 'float')])
+def objective(trial):
+    alpha = trial.suggest_float("alpha", 1e-4, 10.0, log=True)  # L2 正则
+    rank_ratio = trial.suggest_float("rank_ratio", 0.01, 1.0)   # 排序损失占比
+    max_iter = trial.suggest_int("max_iter", 10, 100)
+    tol = trial.suggest_float("tol", 1e-6, 1e-2, log=True)
+
+    c_index_list = []
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    for train_idx, val_idx in kf.split(X_train):
+        X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+        y_tr = y_train_struct[train_idx]
+        y_val = y_train_struct[val_idx]
+
+        model = FastSurvivalSVM(
+            alpha=alpha,
+            rank_ratio=rank_ratio,
+            max_iter=max_iter,
+            tol=tol,
+            random_state=42
+        )
+        model.fit(X_tr, y_tr)
+        preds = model.predict(X_val)
+
+        c_index = concordance_index_censored(
+            y_val["event"],
+            y_val["time"],
+            preds
+        )[0]
+        c_index_list.append(c_index)
+
+    return max(c_index_list)
+
+# 启动调参
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=50)
+print("最佳参数：", study.best_params)
+print("最佳得分：", study.best_value)
+
+
+#------------------------------
+# 使用最优参数训练最终模型
+best_params = study.best_params
+final_model = FastSurvivalSVM(**best_params, random_state=42)
+final_model.fit(X_train, y_train_struct)
+
+# 测试集评估
+y_test_struct = np.array([(e, t) for e, t in zip(y_test['event'], y_test['time'])],
+                         dtype=[('event', 'bool'), ('time', 'float')])
+preds_test = final_model.predict(X_test)
+preds_train = final_model.predict(X_train)
+
+c_index_train = concordance_index_censored(
+    y_train_struct['event'], y_train_struct['time'], preds_train
+)[0]
+print(f"TrainC-index: {c_index_train:.4f}")
+
+c_index_test = concordance_index_censored(
+    y_test_struct['event'], y_test_struct['time'], preds_test
+)[0]
+print(f"Test C-index: {c_index_test:.4f}")

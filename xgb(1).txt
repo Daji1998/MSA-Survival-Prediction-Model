@@ -1,0 +1,197 @@
+#------------------------
+#导入
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+import xgboost as xgb
+import optuna
+import shap
+
+#-----------------------
+#文件导入
+file_path = r'C:\Users\dong\Desktop\dataanalysis\test\selectdataimp.csv'
+survdata = pd.read_csv(file_path)
+print(survdata.head())
+print(survdata.dtypes)
+print(survdata['statues'].value_counts())
+
+#-----------------------
+#数据分割
+import sklearn
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+X = survdata.drop(['statues', 'time2'], axis=1)
+y_time = survdata['time2']
+y_event = survdata['statues']
+X_train, X_test, y_time_train, y_time_test, y_event_train, y_event_test = train_test_split(
+    X, y_time, y_event,
+    test_size=0.3,
+    random_state=42,
+    stratify=y_event  # 按是否发生事件分层抽样
+)
+# 标准化处理（Z-score）
+
+
+# 组合为 dataframe（后面交叉验证中容易处理）
+y_train = pd.DataFrame({'time': y_time_train, 'event': y_event_train})
+y_test = pd.DataFrame({'time': y_time_test, 'event': y_event_test})
+
+print(f"X_train shape: {X_train.shape}")
+print(f"X_test shape: {X_test.shape}")
+print(f"y_train shape: {y_train.shape}")
+print(f"y_test shape: {y_test.shape}")
+
+
+#----------------------------------------
+#变量筛选
+file_path = r'C:\Users\dong\Desktop\dataanalysis\test\selectdataimp.csv'
+survdata = pd.read_csv(file_path) 
+  
+# 筛选指定的9个特征  
+feature_columns = ['FrequentFalls', 'PathologicalSigns',   
+                    'AOscore', 'NLR', 'Age', 'Pscore','VB9','Cscore','statues', 'time2']    
+top9 = survdata[feature_columns]
+print(top9.head())
+X = top9.drop(['statues', 'time2'], axis=1)
+y_time =  top9['time2']
+y_event =  top9['statues']
+X_train, X_test, y_time_train, y_time_test, y_event_train, y_event_test = train_test_split(
+    X, y_time, y_event,
+    test_size=0.3,
+    random_state=42,
+    stratify=y_event)  # 按是否发生事件分层抽样
+
+
+# 组合为 dataframe（后面交叉验证中容易处理）
+y_train = pd.DataFrame({'time': y_time_train, 'event': y_event_train})
+y_test = pd.DataFrame({'time': y_time_test, 'event': y_event_test})
+
+print(f"X_train shape: {X_train.shape}")  
+print(f"X_test shape: {X_test.shape}")  
+print(f"y_train shape: {y_train.shape}")  
+print(f"y_test shape: {y_test.shape}")
+
+#----------------------------------
+#optuna寻参
+from sksurv.metrics import concordance_index_censored
+from sklearn.model_selection import KFold
+def objective(trial):
+    params = {
+        'objective': 'survival:cox',
+        'eval_metric': 'cox-nloglik',
+        'max_depth': trial.suggest_int('max_depth', 3, 6),
+        'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.03, log=True),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+        'min_child_weight': trial.suggest_float('min_child_weight', 1e-2, 10.0, log=True),
+        'gamma': trial.suggest_float('gamma', 0, 1),
+        'lambda': trial.suggest_float('lambda', 1, 3, log=True),
+        'alpha': trial.suggest_float('alpha', 2, 5, log=True),
+        
+        'seed': 7539,
+        'verbosity': 0,
+        'disable_default_eval_metric': 1
+    }
+    num_boost_round = trial.suggest_int('num_boost_round', 100, 1500)
+
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    c_index_list = []
+
+    for train_index, val_index in kf.split(X_train):
+        X_tr, X_val = X_train.iloc[train_index], X_train.iloc[val_index]
+        y_tr, y_val = y_train.iloc[train_index], y_train.iloc[val_index]
+
+        # 构建 DMatrix
+        dtrain = xgb.DMatrix(X_tr, label=y_tr['time'],weight=y_tr['event'])
+        dval = xgb.DMatrix(X_val, label=y_val['time'],weight=y_val['event'])
+
+        # 训练模型
+        model = xgb.train(params, dtrain, num_boost_round=num_boost_round,early_stopping_rounds=50, evals=[(dval, 'eval')], verbose_eval=False)
+
+        # 预测风险分数
+        preds = model.predict(dval)
+
+        # 计算 C-index（注意括号）
+        c_index = concordance_index_censored(
+            y_val['event'].values.astype(bool),
+            y_val['time'].values,
+            preds
+        )[0]
+
+        c_index_list.append(c_index)
+
+    return  np.mean(c_index_list)
+
+study = optuna.create_study(direction="maximize",sampler=optuna.samplers.TPESampler(seed=42)) 
+study.optimize(objective, n_trials=50) 
+print("最佳参数：", study.best_params)
+print("最佳得分：", study.best_value)
+
+#——-------------------------------------------
+#拟合最佳参数
+best_params = study.best_params
+best_params.update({
+    'objective': 'survival:cox',  
+    'eval_metric': 'cox-nloglik',  
+    'max_depth': 3,  # 降低复杂度  
+    'learning_rate': 0.011511579879447065,  # 降低学习率  
+    'subsample': 0.7133688538337751,  # 增加随机性  
+    'colsample_bytree': 0.9878704428101506,  # 减少特征采样  
+    'min_child_weight': 9.314533165542358,  # 增加约束  
+    'gamma': 0.7026992327579986,  # 提高分裂阈值  
+    'lambda': 1.366848611553308,  # 增强L2正则化  
+    'alpha': 2.0203465285025937,  # 增强L1正则化  
+    'num_boost_round': 1499,   
+})
+train = xgb.DMatrix(X_train, label=y_train['time'], weight=y_train['event'])
+dtest = xgb.DMatrix(X_test, label=y_test['time'], weight=y_test['event'])
+best_model=xgb.train(best_params, train, num_boost_round=num_boost_round, early_stopping_rounds=50, evals=[(train, 'train')], verbose_eval=False)
+preds = best_model.predict(train)
+preds_test = best_model.predict(dtest)
+c_index_train = concordance_index_censored(y_train['event'].values.astype(bool), y_train['time'].values, preds)[0]
+print(f"Training C-index: {c_index_train}")
+c_index_test = concordance_index_censored(y_test['event'].values.astype(bool), y_test['time'].values, preds_test)[0]
+print(f"Testing C-index: {c_index_test}")
+risk_score_train = np.exp(preds)  # log(hazard) -> hazard score
+risk_score_test = np.exp(preds_test)
+print("训练集的风险评分：", risk_score_train)
+print("验证集的风险评分：", risk_score_test)
+
+
+#-----------------------------------------
+#计算shap值
+explainer = shap.TreeExplainer(best_model)
+shap_values = explainer.shap_values(X_train)
+
+# 可视化 SHAP 值
+shap.summary_plot(shap_values, X_train)
+shap.summary_plot(shap_values, X_train, plot_type="bar")
+
+
+
+#-------------------------------------------
+#特征依赖图
+import matplotlib.pyplot as plt  
+  
+# 获取特征名称  
+feature_names = X_train.columns  
+  
+# 为每个特征绘制散点依赖图  
+for i, feature_name in enumerate(feature_names):  
+    plt.figure(figsize=(8, 6))  
+      
+    # 绘制SHAP依赖图（散点图）  
+    shap.dependence_plot(  
+        i,  # 特征索引  
+        shap_values,   
+        X_train,  
+        feature_names=feature_names,  
+        interaction_index=None,  # 不显示交互作用  
+        show=False,  
+        dot_size=20,  # 点的大小  
+        alpha=0.7    # 透明度  
+    )  
+      
+    plt.title(f'SHAP dependence plot: {feature_name}')  
+    plt.tight_layout()  
+    plt.show()

@@ -1,0 +1,979 @@
+#导入库
+import numpy as np
+import optuna
+import pandas as pd
+from sklearn.model_selection import KFold
+from sksurv.linear_model import CoxnetSurvivalAnalysis
+from sksurv.metrics import concordance_index_censored
+from sklearn.model_selection import train_test_split
+
+#读取文件
+file_path = r'C:\Users\dong\Desktop\dataanalysis\test\selectdataimp2.csv'
+survdata = pd.read_csv(file_path)
+print(survdata.head())
+print(survdata.dtypes)
+print(survdata['statues'].value_counts())
+
+#分割数据集
+import sklearn
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+X = survdata.drop(['statues', 'time2'], axis=1)
+y_time = survdata['time2']
+y_event = survdata['statues']
+X_train, X_test, y_time_train, y_time_test, y_event_train, y_event_test = train_test_split(
+    X, y_time, y_event,
+    test_size=0.3,
+    random_state=42,
+    stratify=y_event  # 按是否发生事件分层抽样
+)
+
+
+# 组合为 dataframe（后面交叉验证中容易处理）
+y_train = pd.DataFrame({'time': y_time_train, 'event': y_event_train})
+y_test = pd.DataFrame({'time': y_time_test, 'event': y_event_test})
+
+print(f"X_train shape: {X_train.shape}")
+print(f"X_test shape: {X_test.shape}")
+print(f"y_train shape: {y_train.shape}")
+print(f"y_test shape: {y_test.shape}")
+# 合并训练集
+train_df = pd.concat([X_train.reset_index(drop=True), y_train.reset_index(drop=True)], axis=1)
+
+# 合并测试集
+test_df = pd.concat([X_test.reset_index(drop=True), y_test.reset_index(drop=True)], axis=1)
+train_df.to_csv("C:/Users/dong/Desktop/train_dataset.csv", index=False)
+test_df.to_csv("C:/Users/dong/Desktop/test_dataset.csv", index=False)
+
+#optuna超参数调优（可选）coxnet
+y_train_struct = np.array(
+    [(bool(e), t) for e, t in zip(y_train['event'], y_train['time'])],
+    dtype=[('event', 'bool'), ('time', 'float64')]
+)
+
+def objective(trial):
+    # alpha 是正则强度，l1_ratio 控制 Lasso / ElasticNet 比例
+    alpha = trial.suggest_float("alpha", 1e-4, 1.0, log=True)
+    l1_ratio = trial.suggest_float("l1_ratio", 0.0, 1.0)
+
+    c_indices = []
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    for train_idx, val_idx in kf.split(X_train):
+        X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+        y_tr, y_val = y_train_struct[train_idx], y_train_struct[val_idx]
+
+        model = CoxnetSurvivalAnalysis(
+            alphas=[alpha],
+            l1_ratio=l1_ratio,
+            max_iter=10000,
+            tol=1e-5
+        )
+
+        model.fit(X_tr, y_tr)
+        pred = model.predict(X_val)
+        c_index = concordance_index_censored(y_val["event"], y_val["time"], pred)[0]
+        c_indices.append(c_index)
+
+    return np.mean(c_indices)
+study = optuna.create_study(direction="maximize",sampler=optuna.samplers.TPESampler(seed=42))
+study.optimize(objective, n_trials=50)
+
+print("最佳参数：", study.best_params)
+print("最佳得分：", study.best_value)
+
+#最佳参数拟合函数coxnet
+best_params = study.best_params
+final_model = CoxnetSurvivalAnalysis(
+    alphas=[best_params["alpha"]],
+    l1_ratio=best_params["l1_ratio"],
+    max_iter=10000,
+    tol=1e-5
+)
+final_model.fit(X_train, y_train_struct)
+y_test_struct = np.array(
+    [(bool(e), t) for e, t in zip(y_test['event'], y_test['time'])],
+    dtype=[('event', 'bool'), ('time', 'float64')]
+)
+preds_test = final_model.predict(X_test)
+preds_train = final_model.predict(X_train)
+
+c_index_train = concordance_index_censored(
+    y_train_struct['event'], y_train_struct['time'], preds_train
+)[0]
+print(f"TrainC-index: {c_index_train:.4f}")
+
+c_index_test = concordance_index_censored(
+    y_test_struct['event'], y_test_struct['time'], preds_test
+)[0]
+print(f"Test C-index: {c_index_test:.4f}")
+
+
+#-------------------
+#系数非零变量及HRcoxnet
+from sksurv.linear_model import CoxnetSurvivalAnalysis
+coef = final_model.coef_.ravel()
+feature_names = X_train.columns  # 或者 X.columns
+
+# 放入 DataFrame
+coef_df = pd.DataFrame({
+    "feature": feature_names,
+    "coefficient": coef
+})
+
+# 只显示非零系数（即被选中的变量）coxnet
+selected_vars = coef_df[coef_df["coefficient"] != 0].sort_values(by="coefficient", key=abs, ascending=False)
+selected_vars["HR"] = np.exp(selected_vars["coefficient"])
+print(selected_vars.sort_values("HR", ascending=False))
+
+#----------
+#HR置信区间计算bootstrap法coxnet
+cox_model = CoxnetSurvivalAnalysis(
+    alphas=[best_params["alpha"]],
+    l1_ratio=best_params["l1_ratio"],
+    max_iter=10000,
+    tol=1e-5
+)
+selected_vars = coef_df.loc[coef_df["coefficient"] != 0, "feature"].tolist() 
+X_train_selected = X_train[selected_vars]
+cox_model.fit(X_train_selected, y_train_struct)
+# Step 3: 提取系数、HR 和 置信区间
+coefs = cox_model.coef_.ravel()
+hr = np.exp(coefs)
+
+# 近似标准误（采用数值近似方法）
+from sklearn.utils import resample
+n_bootstraps = 200
+boot_coefs = []
+
+for _ in range(n_bootstraps):
+    X_boot, y_boot = resample(X_train_selected, y_train_struct)
+    model =  CoxnetSurvivalAnalysis( alphas=[best_params["alpha"]],
+    l1_ratio=best_params["l1_ratio"],
+    max_iter=10000,
+    tol=1e-5).fit(X_boot, y_boot)
+    boot_coefs.append(model.coef_.ravel())
+
+boot_coefs = np.array(boot_coefs)
+se = boot_coefs.std(axis=0)
+
+# 置信区间
+z = 1.96
+ci_lower = np.exp(coefs - z * se)
+ci_upper = np.exp(coefs + z * se)
+
+# 整合结果
+results = pd.DataFrame({
+    "Variable": selected_vars,
+    "Coefficient": coefs,
+    "HR": hr,
+    "CI_lower_95%": ci_lower,
+    "CI_upper_95%": ci_upper
+}).sort_values(by="HR", ascending=False)
+
+pd.set_option("display.precision", 3)
+print(results)
+
+#---------
+# 计算置换重要性  coxnet
+from sklearn.inspection import permutation_importance  
+ 
+# 计算置换重要性  
+result = permutation_importance(  
+    final_model, X_test, y_test_struct,   
+    n_repeats=15,   
+    random_state=42  
+)  
+  
+# 创建重要性DataFrame  
+importance_df = pd.DataFrame({  
+    'feature': X_train.columns,  
+    'importance_mean': result.importances_mean,  
+    'importance_std': result.importances_std  
+}).sort_values('importance_mean', ascending=False)
+# 置换重要性可视化  coxnet
+# 绘制特征重要性条形图  
+# 只取前10个最重要的特征  
+top_15_importance = importance_df.head(15)  
+  
+plt.figure(figsize=(10, 6))    
+plt.barh(range(len(top_15_importance)), top_15_importance['importance_mean'])    
+plt.yticks(range(len(top_15_importance)), top_15_importance['feature'])    
+plt.xlabel('Permutation Importance')    
+plt.title('Top 15 Feature Importance')    
+plt.grid(True)    
+plt.show()
+
+#------------
+#cox模型挑选变量及重新拟合
+from sklearn.preprocessing import StandardScaler  
+from sklearn.pipeline import make_pipeline  
+selected_features = ['FrequentFalls', 'PathologicalSigns',   
+                    'AOscore', 'NLR', 'Pscore','Cscore','VB9','Age']
+  
+# 筛选特征  
+X11_train = X_train[selected_features]
+X11_test = X_test[selected_features]
+print(f"X11_train shape: {X11_train.shape}")  
+print(f"X11_test shape: {X11_test.shape}")  
+print(f"y_train_struct shape: {y_train_struct.shape}")
+print(f"y_test_struct shape: {y_test_struct.shape}")
+cox_model = CoxPHSurvivalAnalysis(  
+        alpha=0,  # 无正则化  
+        ties='efron',  # 处理并列时间  
+        n_iter=1000,  # 增加迭代次数  
+        verbose=0  # 不显示优化过程  
+    )  
+ 
+  
+# 拟合训练数据  
+cox_model.fit(X11_train, y_train_struct)  
+
+preds_test = cox_model.predict(X11_test)
+preds_train =cox_model.predict(X11_train)
+
+c_index_train = concordance_index_censored(
+    y_train_struct['event'], y_train_struct['time'], preds_train
+)[0]
+print(f"TrainC-index: {c_index_train:.4f}")
+
+c_index_test = concordance_index_censored(
+    y_test_struct['event'], y_test_struct['time'], preds_test
+)[0]
+print(f"Test C-index: {c_index_test:.4f}")
+
+#----------------
+#cox模型计算hr置信区间
+coefs = cox_model.coef_.ravel()  
+hr = np.exp(coefs)  
+  
+# Bootstrap方法估计标准误  
+from sklearn.utils import resample  
+import numpy as np  
+import pandas as pd  
+  
+n_bootstraps = 200  
+boot_coefs = []  
+  
+for _ in range(n_bootstraps):  
+    # 重采样数据  
+    X_boot, y_boot = resample(X11_train, y_train_struct, random_state=None)  
+      
+    # 拟合同样配置的Cox模型  
+    model = CoxPHSurvivalAnalysis(  
+        alpha=cox_model.alpha,  
+        ties=cox_model.ties,  
+        n_iter=cox_model.n_iter,  
+        tol=1e-5,  
+        verbose=0  
+    ).fit(X_boot, y_boot)  
+      
+    boot_coefs.append(model.coef_.ravel())  
+  
+boot_coefs = np.array(boot_coefs)  
+se = boot_coefs.std(axis=0)  
+  
+# 计算95%置信区间  
+z = 1.96  
+ci_lower = np.exp(coefs - z * se)  
+ci_upper = np.exp(coefs + z * se)  
+  
+# 整合结果  
+feature_names = X11_train.columns if hasattr(X11_train, 'columns') else [f'Feature_{i}' for i in range(len(coefs))]  
+  
+results = pd.DataFrame({  
+    "Variable": feature_names,  
+    "Coefficient": coefs,  
+    "HR": hr,  
+    "CI_lower_95%": ci_lower,  
+    "CI_upper_95%": ci_upper  
+}).sort_values(by="HR", ascending=False)  
+  
+pd.set_option("display.precision", 3)  
+print(results)
+
+
+#----------------
+#timedependenceAUC计算
+from sksurv.metrics import cumulative_dynamic_auc  
+preds_test = cox_model.predict(X11_test)
+preds_train =cox_model.predict(X11_train) 
+times = np.percentile(y_train_struct['time'], np.linspace(10, 90, 15))     
+# 计算AUC  
+auc_train, mean_auc_train = cumulative_dynamic_auc(y_train_struct, y_train_struct, preds_train, times)  
+auc_test, mean_auc_test = cumulative_dynamic_auc(y_train_struct, y_test_struct, preds_test, times)  
+# 创建可视化  
+plt.figure(figsize=(10, 6))  
+  
+line1 = plt.plot(times, auc_train, marker="s", label=f"Cox Train (mean AUC = {mean_auc_train:.3f})")  
+line2 = plt.plot(times, auc_test, marker="o", label=f"Cox Test (mean AUC = {mean_auc_test:.3f})")  
+  
+# 添加平均AUC水平线，使用与折线相同的颜色  
+plt.axhline(mean_auc_train, color=line1[0].get_color(), linestyle="--", alpha=0.7)  
+plt.axhline(mean_auc_test, color=line2[0].get_color(), linestyle="--", alpha=0.7)
+
+plt.xlabel("time")  
+plt.ylabel("time dependence AUC") 
+plt.ylim(0, 1)
+plt.legend()  
+plt.grid(True)  
+
+plt.show()  
+  
+# 打印结果  
+print(f"Training Set Mean AUC: {mean_auc_train:.3f}")  
+print(f"Test Set Mean AUC: {mean_auc_test:.3f}")
+
+
+
+
+#------------------------
+#Brier分数计算及可视化
+from sksurv.metrics import integrated_brier_score, brier_score  
+# 获取训练集和测试集的生存函数预测  
+survival_functions_train = cox_model.predict_survival_function(X11_train)  
+survival_functions_test = cox_model.predict_survival_function(X11_test)  
+  
+# 将生存函数在指定时间点的值转换为数组  
+survival_probabilities_train = np.array([[fn(t) for t in times] for fn in survival_functions_train])  
+survival_probabilities_test = np.array([[fn(t) for t in times] for fn in survival_functions_test])  
+  
+# 计算训练集和测试集的时间依赖Brier分数  
+times_bs_train, brier_scores_train = brier_score(y_train_struct, y_train_struct, survival_probabilities_train, times)  
+times_bs_test, brier_scores_test = brier_score(y_train_struct, y_test_struct, survival_probabilities_test, times)  
+  
+# 计算积分Brier分数  
+ibs_train = integrated_brier_score(y_train_struct, y_train_struct, survival_probabilities_train, times)  
+ibs_test = integrated_brier_score(y_train_struct, y_test_struct, survival_probabilities_test, times)  
+  
+# 可视化时间依赖的Brier分数  
+plt.figure(figsize=(10, 6))  
+  
+# 绘制训练集和测试集Brier分数，获取颜色  
+line1 = plt.plot(times_bs_train, brier_scores_train, marker="s", label=f"Cox Train (IBS = {ibs_train:.3f})")  
+line2 = plt.plot(times_bs_test, brier_scores_test, marker="o", label=f"Cox Test (IBS = {ibs_test:.3f})")  
+  
+# 添加与折线相同颜色的水平线  
+plt.axhline(ibs_train, color=line1[0].get_color(), linestyle="--", alpha=0.7)  
+plt.axhline(ibs_test, color=line2[0].get_color(), linestyle="--", alpha=0.7)  
+  
+plt.xlabel("Time")  
+plt.ylabel("Brier Score")  
+plt.title("Time-dependent Brier Score: Training vs Test Set")  
+plt.ylim(0, max(max(brier_scores_train), max(brier_scores_test)) * 1.1)  # 设置y轴范围  
+plt.legend()  
+plt.grid(True, alpha=0.3)  
+plt.show()  
+  
+print(f"Training Set IBS: {ibs_train:.3f}")  
+print(f"Test Set IBS: {ibs_test:.3f}")  
+print(f"IBS Difference: {ibs_train - ibs_test:.3f}")
+
+
+#-----------------------------
+#校准曲线斜率和截距计算
+def plot_calibration_slopes_only(y_true, survival_probs, times, n_bins=10):  
+    """  
+    只绘制校准斜率的简化图表  
+    """  
+    calibration_slopes = []  
+    calibration_intercepts = []  
+    valid_times = []  
+      
+    for time_idx, time_value in enumerate(times):  
+        # 获取指定时间点的预测概率  
+        pred_probs = survival_probs[:, time_idx]  
+          
+        # 创建二元结果  
+        event_indicator = y_true['event']  
+        event_time = y_true['time']  
+          
+        actual_survival = np.where(  
+            (event_indicator == 1) & (event_time <= time_value), 0,  
+            np.where(event_time > time_value, 1, np.nan)  
+        )  
+          
+        # 移除无法确定的样本  
+        valid_mask = ~np.isnan(actual_survival)  
+        pred_probs_valid = pred_probs[valid_mask]  
+        actual_survival_valid = actual_survival[valid_mask]  
+          
+        if len(pred_probs_valid) < 10:  # 样本太少跳过  
+            continue  
+              
+        # 分组计算  
+        bin_boundaries = np.linspace(0, 1, n_bins + 1)  
+        observed_freq = []  
+        predicted_freq = []  
+          
+        for i in range(n_bins):  
+            bin_mask = (pred_probs_valid >= bin_boundaries[i]) & (pred_probs_valid < bin_boundaries[i+1])  
+            if i == n_bins - 1:  
+                bin_mask = (pred_probs_valid >= bin_boundaries[i]) & (pred_probs_valid <= bin_boundaries[i+1])  
+              
+            if np.sum(bin_mask) > 0:  
+                observed_freq.append(np.mean(actual_survival_valid[bin_mask]))  
+                predicted_freq.append(np.mean(pred_probs_valid[bin_mask]))  
+          
+        # 计算校准斜率  
+        if len(observed_freq) > 1:  
+            slope, intercept = np.polyfit(predicted_freq, observed_freq, 1)  
+            calibration_slopes.append(slope)  
+            calibration_intercepts.append(intercept)  
+            valid_times.append(time_value)  
+      
+    # 绘制简化的斜率图  
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))  
+      
+    # 校准斜率随时间变化  
+    ax1.plot(valid_times, calibration_slopes, 'o-', linewidth=2, markersize=6)  
+    ax1.axhline(1.0, color='red', linestyle='--', alpha=0.7, label='Perfect Calibration (slope=1)')  
+    ax1.set_xlabel('Time')  
+    ax1.set_ylabel('Calibration Slope')  
+    ax1.set_title('Calibration Slope Over Time')  
+    ax1.legend()  
+    ax1.grid(True, alpha=0.3)  
+      
+    # 校准截距随时间变化  
+    ax2.plot(valid_times, calibration_intercepts, 'o-', linewidth=2, markersize=6, color='orange')  
+    ax2.axhline(0.0, color='red', linestyle='--', alpha=0.7, label='Perfect Calibration (intercept=0)')  
+    ax2.set_xlabel('Time')  
+    ax2.set_ylabel('Calibration Intercept')  
+    ax2.set_title('Calibration Intercept Over Time')  
+    ax2.legend()  
+    ax2.grid(True, alpha=0.3)  
+      
+    plt.tight_layout()  
+    plt.show()  
+      
+    # 输出总结统计  
+    mean_slope = np.mean(calibration_slopes)  
+    mean_intercept = np.mean(calibration_intercepts)  
+      
+    print(f"平均校准斜率: {mean_slope:.3f} (理想值: 1.000)")  
+    print(f"平均校准截距: {mean_intercept:.3f} (理想值: 0.000)")  
+    print(f"斜率标准差: {np.std(calibration_slopes):.3f}")  
+    print(f"截距标准差: {np.std(calibration_intercepts):.3f}")  
+      
+    return calibration_slopes, calibration_intercepts, valid_times  
+  
+# 使用您的数据  
+slopes, intercepts, times_valid = plot_calibration_slopes_only(  
+    y_test_struct, survival_probabilities_test, times  
+)
+# 显示每个有效时间点对应的斜率和截距  
+print("\n有效时间点详细信息:")  
+print("时间点\t\t斜率\t\t截距")  
+print("-" * 50)  
+for i, (time_point, slope, intercept) in enumerate(zip(times_valid, slopes, intercepts)):  
+    print(f"{time_point:.1f}\t\t{slope:.3f}\t\t{intercept:.3f}")  
+  
+# 特别显示倒数第4和第5个时间点  
+if len(times_valid) >= 5:  
+    print(f"\n倒数第5个时间点: {times_valid[-5]:.1f}")  
+    print(f"  - 斜率: {slopes[-5]:.3f}")  
+    print(f"  - 截距: {intercepts[-5]:.3f}")  
+      
+    print(f"\n倒数第4个时间点: {times_valid[-4]:.1f}")  
+    print(f"  - 斜率: {slopes[-4]:.3f}")  
+    print(f"  - 截距: {intercepts[-4]:.3f}")  
+else:  
+    print(f"\n总共只有 {len(times_valid)} 个有效时间点，无法显示倒数第4和第5个")
+
+
+#-------------------------------
+#校准曲线可视化
+import matplotlib.pyplot as plt  
+import numpy as np  
+from sklearn.calibration import calibration_curve  
+from sklearn.linear_model import LinearRegression    
+
+# 绘制校准曲线  
+plt.figure(figsize=(8, 6))  
+  
+# 完美校准线（实线，斜率为1）  
+plt.plot([0, 1], [0, 1], 'k-', linewidth=2, label='perfect calibration curve')  
+  
+ 
+# 绘制拟合的直线  
+x_line = np.linspace(0, 1, 100)  
+y_line = 1.026 * x_line -0.019  
+  
+plt.plot(x_line, y_line, 'r-', linewidth=2, color='lightblue' , 
+         label=f'smooth calibration curve (slope={1.033:.3f}, intercept={0.003:.3f})')  
+  
+  
+plt.xlabel('predict probability')  
+plt.ylabel('observed probability')  
+plt.title('calibration curve')  
+plt.legend()  
+plt.grid(True, alpha=0.3)  
+plt.xlim([0, 1])  
+plt.ylim([0, 1])  
+  
+plt.tight_layout()  
+plt.show()
+
+
+
+#----------------------------------
+#DCA曲线绘制
+from sklearn.utils.extmath import stable_cumsum  
+def prepare_survival_data_for_dca(cox_model, X_test, y_test_struct, X_train, y_train_struct, time_point=6):  
+    # 确保Cox模型设置了基线模型    
+    if not hasattr(cox_model, '_baseline_model') or cox_model._baseline_model is None:    
+        cox_model_with_baseline = CoxPHSurvivalAnalysis(    
+            alpha=0, ties='efron', n_iter=1000, verbose=0,     
+            fit_baseline_model=True  
+        )    
+        cox_model_with_baseline.fit(X11_train, y_train_struct)  
+        cox_model = cox_model_with_baseline  
+        
+    # 获取生存函数预测    
+    surv_funcs = cox_model.predict_survival_function(X11_test)    
+    survival_probs = np.array([fn(time_point) for fn in surv_funcs])    
+    event_probs = 1 - survival_probs    
+        
+    # 创建二元结果  
+    event_indicator = y_test_struct['event']  
+    event_time = y_test_struct['time']  
+        
+    y_binary = np.where(    
+        (event_indicator == 1) & (event_time <= time_point), 1,  
+        np.where(event_time > time_point, 0, np.nan)  
+    )    
+        
+    valid_mask = ~np.isnan(y_binary)    
+    y_binary = y_binary[valid_mask].astype(int)    
+    event_probs = event_probs[valid_mask]    
+        
+    return y_binary, event_probs  
+  
+def plot_dca_for_cox_model(cox_model, X_test, y_test_struct, X_train, y_train_struct, time_point=6, model_name="Cox Model"):  
+    # 准备数据    
+    y_binary, y_prob = prepare_survival_data_for_dca(cox_model, X11_test, y_test_struct, X11_train, y_train_struct, time_point)  
+      
+  
+
+
+      
+    # 计算净效益  
+    thresholds, net_benefits = calculate_net_benefit_model_new(y_binary, y_prob)  
+      
+    # 计算参考线  
+    # "全部治疗"策略的净效益  
+    prevalence = np.mean(y_binary)  
+    treat_all_nb = prevalence - (1 - prevalence) * (thresholds / (1 - thresholds))  
+    treat_all_nb = np.maximum(treat_all_nb, 0)  # 净效益不能为负  
+      
+    # "全部不治疗"策略的净效益（始终为0）  
+    treat_none_nb = np.zeros_like(thresholds)  
+      
+    # 绘制DCA曲线  
+    plt.figure(figsize=(10, 6))  
+    plt.plot(thresholds, net_benefits, label=f'{model_name}', linewidth=2)  
+    plt.plot(thresholds, treat_all_nb, label='Treat All', linestyle='--', alpha=0.7)  
+    plt.plot(thresholds, treat_none_nb, label='Treat None', linestyle=':', alpha=0.7)  
+      
+    plt.xlabel('Threshold Probability')  
+    plt.ylabel('Net Benefit')  
+    plt.title(f'Decision Curve Analysis at {time_point} years')  
+    plt.legend()  
+    plt.grid(True, alpha=0.3)  
+    plt.xlim(0, 1)  
+      
+    # 只显示有意义的净效益范围  
+    max_nb = np.max([np.max(net_benefits), np.max(treat_all_nb)])  
+    plt.ylim(-0.01, max_nb * 1.1)  
+      
+    plt.show()  
+      
+    return thresholds, net_benefits
+def _binary_clf_curve(y_true, y_prob, pos_label=1):  
+    y_true = np.ravel(y_true)  
+    y_prob = np.ravel(y_prob)  
+    pos_label = 1  
+    y_true = y_true == pos_label  
+  
+    desc_prob_indices = np.argsort(y_prob, kind="mergesort")[::-1]  
+    y_prob = y_prob[desc_prob_indices]  
+    y_true = y_true[desc_prob_indices]  
+  
+    distinct_value_indices = np.where(np.diff(y_prob))[0]  
+    threshold_idxs = np.r_[distinct_value_indices, y_true.size - 1]  
+  
+    tps = stable_cumsum(y_true)[threshold_idxs]  
+    fps = 1 + threshold_idxs - tps  
+    thresholds = y_prob[threshold_idxs]  
+      
+    return fps, tps, thresholds   
+  
+def calculate_net_benefit_model_new(y_true, y_prob, pos_label=1, n_points=1000):  
+    fps, tps, thresholds = _binary_clf_curve(y_true, y_prob, pos_label)  
+      
+    # 阈值概率取无限接近1时，真阳性和假阳性都为0  
+    tps = np.r_[0, tps]  
+    fps = np.r_[0, fps]  
+    thresholds = np.r_[max(thresholds[0], 1-1e-10), thresholds]  
+  
+    n = y_true.size  
+      
+    # 升序排列  
+    sort_indices = np.argsort(thresholds, kind="mergesort")  
+    thresholds = thresholds[sort_indices]  
+    tps = tps[sort_indices]  
+    fps = fps[sort_indices]  
+  
+    interp_thresholds = np.linspace(0, 1-1/n_points, n_points)  
+    binids = np.searchsorted(thresholds[:-1], interp_thresholds)  
+    net_benefits = (tps[binids] / n) - (fps[binids] / n) * (interp_thresholds / (1 - interp_thresholds))  
+      
+    return interp_thresholds, net_benefits
+thresholds, net_benefits = plot_dca_for_cox_model(    
+    cox_model=cox_model,  
+    X_test=X11_test,  
+    y_test_struct=y_test_struct,  
+    X_train=X11_train,  
+    y_train_struct=y_train_struct,  
+    time_point=6,  
+    model_name="Cox  Model"       
+)
+
+
+
+#----------------------------------
+#基于风险评分绘制km曲线-二分
+def create_risk_groups_by_score(risk_scores, labels=['Low Risk', 'High Risk']):  
+    """基于风险评分创建风险分组（二分组）"""  
+    # 使用中位数进行分组  
+    q50 = np.percentile(risk_scores, 50)  
+    # 创建分组  
+    risk_groups = np.where(risk_scores <= q50, labels[0], labels[1])  
+    return risk_groups, (q50,)
+def print_detailed_stats(dataset_name, chisq, pvalue, median_info, thresholds):  
+    """打印详细的统计结果（二分组）"""  
+    print(f"\n=== {dataset_name}详细统计结果 ===")  
+    print(f"Log-rank检验:")  
+    print(f" χ² = {chisq:.4f}")  
+    print(f" p值 = {pvalue:.6f}")  
+    if pvalue < 0.05:  
+        print(f" 结论: 不同风险组间生存差异具有统计学意义")  
+    else:  
+        print(f" 结论: 不同风险组间生存差异无统计学意义")  
+      
+    print(f"\n风险评分阈值:")  
+    print(f" 低风险: ≤ {thresholds[0]:.3f}")  
+    print(f" 高风险: > {thresholds[0]:.3f}")  
+      
+    print(f"\n各风险组中位生存时间和置信区间:")  
+    risk_level_mapping = {  
+        'Low Risk': '低风险',  
+        'High Risk': '高风险'  
+    }  
+      
+    for eng_risk_level, cn_risk_level in risk_level_mapping.items():  
+        if eng_risk_level in median_info:  
+            info = median_info[eng_risk_level]  
+            print(f" {cn_risk_level}:")  
+            print(f" 患者数: {info['n_patients']}")  
+            print(f" 风险评分范围: {info['risk_score_range']}")  
+            if info['median_time'] != "Not reached":  
+                print(f" 中位生存时间: {info['median_time']:.1f}")   
+            else:  
+                print(f" 中位生存时间: 未达到")  
+               
+
+def plot_km_with_stats(y_data, risk_groups, risk_scores, title, dataset_name):  
+    """绘制KM曲线并计算中位生存时间、置信区间和log-rank检验"""  
+    # 转换为结构化数组格式  
+    if isinstance(y_data, pd.DataFrame):  
+        from sksurv.util import Surv  
+        y_struct = Surv.from_arrays(y_data['event'].values, y_data['time'].values)  
+    else:  
+        y_struct = y_data  
+      
+    # 计算log-rank检验  
+    chisq, pvalue = compare_survival(y_struct, risk_groups)  
+      
+    # 创建图形  
+    plt.figure(figsize=(12, 8))  
+      
+    # 为每个风险组绘制KM曲线 - 使用英文标签  
+    colors = ['green', 'orange', 'red']  
+    risk_labels = ['Low Risk', 'Medium Risk', 'High Risk']  
+      
+    # 存储中位生存时间信息  
+    median_survival_info = {}  
+      
+    for i, (risk_label, color) in enumerate(zip(risk_labels, colors)):  
+        mask = risk_groups == risk_label  
+        if mask.sum() > 0:  # 确保该组有样本  
+            # 计算该组的KM估计（包含置信区间）  
+            time, survival_prob = kaplan_meier_estimator(  
+                y_struct['event'][mask],   
+                y_struct['time'][mask]
+            )  
+              
+            # 绘制生存曲线  
+            plt.step(time, survival_prob, where="post",   
+                    label=f'{risk_label} (n={mask.sum()})',   
+                    color=color, linewidth=2)   
+              
+           
+            # 计算中位生存时间  
+            median_idx = np.where(survival_prob <= 0.5)[0]  
+            if len(median_idx) > 0:  
+                median_time = time[median_idx[0]]  
+                median_survival_info[risk_label] = {  
+                    'median_time': median_time,  
+                    'n_patients': mask.sum(),  
+                    'risk_score_range': f"[{risk_scores[mask].min():.3f}, {risk_scores[mask].max():.3f}]"  
+                }  
+            else:  
+                median_survival_info[risk_label] = {  
+                    'median_time': "Not reached",  
+                    'n_patients': mask.sum(),  
+                    'risk_score_range': f"[{risk_scores[mask].min():.3f}, {risk_scores[mask].max():.3f}]"  
+                }  
+      
+    # 设置图形属性  
+    plt.ylim(0, 1)  
+    plt.xlabel('Time', fontsize=12)  
+    plt.ylabel('Survival Probability', fontsize=12)  
+    plt.title(f'{title}\nLog-rank test: χ²={chisq:.3f}, p={pvalue:.4f}',   
+              fontsize=14, fontweight='bold')  
+    plt.legend(loc='best', fontsize=11)  
+    plt.grid(True, alpha=0.3)  
+      
+    # 添加统计信息文本框  
+    if pvalue < 0.001:  
+        p_text = "p < 0.001"  
+    elif pvalue < 0.01:  
+        p_text = f"p = {pvalue:.3f}"  
+    else:  
+        p_text = f"p = {pvalue:.3f}"  
+      
+    textstr = f'Log-rank test:\nχ² = {chisq:.3f}\n{p_text}'  
+    if pvalue < 0.05:  
+        textstr += '\n(Significant difference)'  
+    else:  
+        textstr += '\n(No significant difference)'  
+      
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)  
+    plt.text(0.02, 0.02, textstr, transform=plt.gca().transAxes,   
+             fontsize=10, verticalalignment='bottom', bbox=props)  
+      
+    plt.tight_layout()  
+    plt.show()  
+      
+    return chisq, pvalue, median_survival_info
+
+
+# Calculate risk scores using Cox model  
+print("计算风险评分...")  
+train_risk_scores = cox_model.predict(X11_train)  
+test_risk_scores = cox_model.predict(X11_test)  
+  
+# Create risk groups (binary classification)  
+train_risk_groups, train_thresholds = create_risk_groups_by_score(train_risk_scores)  
+test_risk_groups, test_thresholds = create_risk_groups_by_score(test_risk_scores)  
+  
+print(f"训练集风险分组分布:")  
+print(pd.Series(train_risk_groups).value_counts())  
+print(f"\n测试集风险分组分布:")  
+print(pd.Series(test_risk_groups).value_counts())  
+  
+# Plot KM curves for training set  
+print("\n=== 训练集分析 ===")  
+train_chisq, train_pvalue, train_median_info = plot_km_with_stats(  
+    y_train_struct,   
+    train_risk_groups,   
+    train_risk_scores,  
+    'Training Set - Cox Model Risk-based Survival Curves',   
+    '训练集_Cox'  
+)  
+  
+# Plot KM curves for test set  
+print("\n=== 测试集分析 ===")  
+test_chisq, test_pvalue, test_median_info = plot_km_with_stats(  
+    y_test_struct,   
+    test_risk_groups,   
+    test_risk_scores,  
+    'Test Set - Cox Model Risk-based Survival Curves',   
+    '测试集_Cox'  
+)  
+
+
+
+
+
+#-------------------------------------------------
+#基于风险评分绘制km曲线-三分
+def create_risk_groups_by_score_three(risk_scores, labels=['Low Risk', 'Medium Risk', 'High Risk']):  
+    """基于风险评分创建风险分组（三分组）"""  
+    # 使用33%和67%分位数进行分组  
+    q33 = np.percentile(risk_scores, 33.33)  
+    q67 = np.percentile(risk_scores, 66.67)  
+      
+    # 创建分组  
+    risk_groups = np.where(risk_scores <= q33, labels[0],   
+                          np.where(risk_scores <= q67, labels[1], labels[2]))  
+    return risk_groups, (q33, q67)
+def plot_km_with_stats_no_ci(y_data, risk_groups, risk_scores, title, dataset_name):  
+    """绘制KM曲线并计算中位生存时间和log-rank检验（无置信区间）"""  
+    # 转换为结构化数组格式  
+    if isinstance(y_data, pd.DataFrame):  
+        from sksurv.util import Surv  
+        y_struct = Surv.from_arrays(y_data['event'].values, y_data['time'].values)  
+    else:  
+        y_struct = y_data  
+      
+    # 计算log-rank检验  
+    chisq, pvalue = compare_survival(y_struct, risk_groups)  
+      
+    # 创建图形  
+    plt.figure(figsize=(12, 8))  
+      
+    # 为每个风险组绘制KM曲线  
+    colors = ['green', 'orange', 'red']  
+    risk_labels = ['Low Risk', 'Medium Risk', 'High Risk']  
+      
+    # 存储中位生存时间信息  
+    median_survival_info = {}  
+      
+    for i, (risk_label, color) in enumerate(zip(risk_labels, colors)):  
+        mask = risk_groups == risk_label  
+        if mask.sum() > 0:  # 确保该组有样本  
+            # 计算该组的KM估计（不包含置信区间）  
+            time, survival_prob = kaplan_meier_estimator(  
+                y_struct['event'][mask],   
+                y_struct['time'][mask]  
+            )  
+              
+            # 绘制生存曲线  
+            plt.step(time, survival_prob, where="post",   
+                    label=f'{risk_label} (n={mask.sum()})',   
+                    color=color, linewidth=2)  
+              
+            # 计算中位生存时间  
+            median_idx = np.where(survival_prob <= 0.5)[0]  
+            if len(median_idx) > 0:  
+                median_time = time[median_idx[0]]  
+                median_survival_info[risk_label] = {  
+                    'median_time': median_time,  
+                    'n_patients': mask.sum(),  
+                    'risk_score_range': f"[{risk_scores[mask].min():.3f}, {risk_scores[mask].max():.3f}]"  
+                }  
+            else:  
+                median_survival_info[risk_label] = {  
+                    'median_time': "Not reached",  
+                    'n_patients': mask.sum(),  
+                    'risk_score_range': f"[{risk_scores[mask].min():.3f}, {risk_scores[mask].max():.3f}]"  
+                }  
+      
+    # 设置图形属性  
+    plt.ylim(0, 1)  
+    plt.xlabel('Time', fontsize=12)  
+    plt.ylabel('Survival Probability', fontsize=12)  
+    plt.title(f'{title}\nLog-rank test: χ²={chisq:.3f}, p={pvalue:.4f}',   
+              fontsize=14, fontweight='bold')  
+    plt.legend(loc='best', fontsize=11)  
+    plt.grid(True, alpha=0.3)  
+      
+    # 添加统计信息文本框  
+    if pvalue < 0.001:  
+        p_text = "p < 0.001"  
+    elif pvalue < 0.01:  
+        p_text = f"p = {pvalue:.3f}"  
+    else:  
+        p_text = f"p = {pvalue:.3f}"  
+      
+    textstr = f'Log-rank test:\nχ² = {chisq:.3f}\n{p_text}'  
+    if pvalue < 0.05:  
+        textstr += '\n(Significant difference)'  
+    else:  
+        textstr += '\n(No significant difference)'  
+      
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)  
+    plt.text(0.02, 0.02, textstr, transform=plt.gca().transAxes,   
+             fontsize=10, verticalalignment='bottom', bbox=props)  
+      
+    plt.tight_layout()  
+  
+    plt.show()  
+      
+    return chisq, pvalue, median_survival_info
+def print_detailed_stats_three(dataset_name, chisq, pvalue, median_info, thresholds):  
+    """打印详细的统计结果（三分组）"""  
+    print(f"\n=== {dataset_name}详细统计结果 ===")  
+    print(f"Log-rank检验:")  
+    print(f" χ² = {chisq:.4f}")  
+    print(f" p值 = {pvalue:.6f}")  
+    if pvalue < 0.05:  
+        print(f" 结论: 不同风险组间生存差异具有统计学意义")  
+    else:  
+        print(f" 结论: 不同风险组间生存差异无统计学意义")  
+      
+    print(f"\n风险评分阈值:")  
+    print(f" 低风险: ≤ {thresholds[0]:.3f}")  
+    print(f" 中风险: {thresholds[0]:.3f} < score ≤ {thresholds[1]:.3f}")  
+    print(f" 高风险: > {thresholds[1]:.3f}")  
+      
+    print(f"\n各风险组中位生存时间:")  
+    risk_level_mapping = {  
+        'Low Risk': '低风险',  
+        'Medium Risk': '中风险',   
+        'High Risk': '高风险'  
+    }  
+      
+    for eng_risk_level, cn_risk_level in risk_level_mapping.items():  
+        if eng_risk_level in median_info:  
+            info = median_info[eng_risk_level]  
+            print(f" {cn_risk_level}:")  
+            print(f" 患者数: {info['n_patients']}")  
+            print(f" 风险评分范围: {info['risk_score_range']}")  
+            if info['median_time'] != "Not reached":  
+                print(f" 中位生存时间: {info['median_time']:.1f}")  
+            else:  
+                print(f" 中位生存时间: 未达到")
+print("计算风险评分...")  
+train_risk_scores = cox_model.predict(X11_train)  
+test_risk_scores = cox_model.predict(X11_test)  
+  
+# 创建训练集和测试集的风险分组（三分组）  
+train_risk_groups, train_thresholds = create_risk_groups_by_score_three(train_risk_scores)  
+test_risk_groups, test_thresholds = create_risk_groups_by_score_three(test_risk_scores)  
+  
+print(f"训练集风险分组分布:")  
+print(pd.Series(train_risk_groups).value_counts())  
+print(f"\n测试集风险分组分布:")  
+print(pd.Series(test_risk_groups).value_counts())  
+  
+# 绘制训练集KM曲线（无置信区间）  
+print("\n=== 训练集分析 ===")  
+train_chisq, train_pvalue, train_median_info = plot_km_with_stats_no_ci(  
+    y_train_struct,   
+    train_risk_groups,   
+    train_risk_scores,  
+    'Training Set - Cox Model Risk-based Survival Curves (3 Groups)',   
+    '训练集_Cox_3groups'  
+)  
+  
+# 绘制测试集KM曲线（无置信区间）  
+print("\n=== 测试集分析 ===")  
+test_chisq, test_pvalue, test_median_info = plot_km_with_stats_no_ci(  
+    y_test_struct,   
+    test_risk_groups,   
+    test_risk_scores,  
+    'Test Set - Cox Model Risk-based Survival Curves (3 Groups)',   
+    '测试集_Cox_3groups'  
+)  
+  
+# 打印详细统计结果  
+print_detailed_stats_three("训练集_Cox", train_chisq, train_pvalue, train_median_info, train_thresholds)  
+print_detailed_stats_three("测试集_Cox", test_chisq, test_pvalue, test_median_info, test_thresholds)
+
+
+
+
+

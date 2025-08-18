@@ -1,0 +1,274 @@
+#--------------------------
+#导入
+import pandas as pd
+import numpy as np
+from sksurv.ensemble import RandomSurvivalForest
+from sksurv.metrics import concordance_index_censored
+from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold
+
+#--------------------------
+#全文件集导入
+file_path = r'C:\Users\dong\Desktop\dataanalysis\test\selectdataimp2.csv'
+survdata = pd.read_csv(file_path)
+print(survdata.head())
+print(survdata.dtypes)
+print(survdata['statues'].value_counts())
+#---------------------------------
+#数据分割
+import sklearn
+import numpy as np
+X = survdata.drop(['statues', 'time2'], axis=1)
+y_time = survdata['time2']
+y_event = survdata['statues']
+X_train, X_test, y_time_train, y_time_test, y_event_train, y_event_test = train_test_split(
+    X, y_time, y_event,
+    test_size=0.3,
+    random_state=42,
+    stratify=y_event  # 按是否发生事件分层抽样
+)
+
+# 组合为 dataframe（后面交叉验证中容易处理）
+y_train = pd.DataFrame({'time': y_time_train, 'event': y_event_train})
+y_test = pd.DataFrame({'time': y_time_test, 'event': y_event_test})
+
+print(f"X_train shape: {X_train.shape}")
+print(f"X_test shape: {X_test.shape}")
+print(f"y_train shape: {y_train.shape}")
+print(f"y_test shape: {y_test.shape}")
+
+#--------------------------
+#筛选特定变量
+file_path = r'C:\Users\dong\Desktop\dataanalysis\test\selectdataimp.csv'
+survdata = pd.read_csv(file_path) 
+  
+# 筛选指定的9个特征  
+feature_columns = ['FrequentFalls', 'PathologicalSigns',   
+                    'AOscore', 'NLR', 'AidWalking', 'Pscore','VB9','statues', 'time2']  
+top9 = survdata[feature_columns]
+print(top9.head())
+X = top9.drop(['statues', 'time2'], axis=1)
+y_time =  top9['time2']
+y_event =  top9['statues']
+X_train, X_test, y_time_train, y_time_test, y_event_train, y_event_test = train_test_split(
+    X, y_time, y_event,
+    test_size=0.3,
+    random_state=42,
+    stratify=y_event)  # 按是否发生事件分层抽样
+
+
+# 组合为 dataframe（后面交叉验证中容易处理）
+y_train = pd.DataFrame({'time': y_time_train, 'event': y_event_train})
+y_test = pd.DataFrame({'time': y_time_test, 'event': y_event_test})
+
+print(f"X_train shape: {X_train.shape}")  
+print(f"X_test shape: {X_test.shape}")  
+print(f"y_train shape: {y_train.shape}")  
+print(f"y_test shape: {y_test.shape}")
+
+#----------------------------------
+#optuna寻参（可选）
+import optuna
+from sksurv.ensemble import RandomSurvivalForest
+from sksurv.metrics import concordance_index_censored
+from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedKFold  
+y_train_struct = np.array([(e, t) for e, t in zip(y_train['event'], y_train['time'])],
+                                   dtype=[('event', 'bool'), ('time', 'float')])
+def objective(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 500, 1100),
+        'max_depth': trial.suggest_int('max_depth', 3, 6),
+        'min_samples_split': trial.suggest_int('min_samples_split', 25, 30),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 10, 30),
+        'max_features': trial.suggest_categorical('max_features', [ 0.2, 0.4]),
+        'random_state': 42
+    }
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)  
+    c_indices = []
+
+    for train_idx, val_idx in skf.split(X_train, y_train_struct['event']):
+        X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+        y_tr, y_val = y_train_struct[train_idx], y_train_struct[val_idx]
+
+        
+       
+        # 构建 RandomSurvivalForest 模型
+        model = RandomSurvivalForest(
+            n_estimators=params['n_estimators'],
+            max_depth=params['max_depth'],
+            min_samples_split=params['min_samples_split'],
+            min_samples_leaf=params['min_samples_leaf'],
+            max_features=params['max_features'],
+            random_state=params['random_state'],
+            n_jobs=-1
+        )
+
+        # 拟合模型
+        model.fit(X_tr, y_tr)
+
+        # 预测风险分数
+        preds = model.predict(X_val)
+
+        # 计算 C-index
+        c_index = concordance_index_censored(
+            y_val['event'].astype(bool),
+            y_val['time'],
+            preds
+        )[0]
+
+        c_indices.append(c_index)
+
+    return np.mean(c_indices) 
+
+# 创建 Optuna 学习过程
+study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))  # 我们希望最大化 C-index
+study.optimize(objective, n_trials=50)  # 进行 50 次调参试验
+print("最佳参数：", study.best_params)
+print("最佳得分：", study.best_value)
+
+#-------------------------------------------
+#拟合最佳参数
+from sksurv.ensemble import RandomSurvivalForest
+# 提取 Optuna 搜索到的最佳参数
+
+best_params = study.best_params
+# 将 y_train, y_test 转换为结构化数组
+y_train_struct = np.array([(e, t) for e, t in zip(y_train['event'], y_train['time'])],
+                          dtype=[('event', 'bool'), ('time', 'float')])
+y_test_struct = np.array([(e, t) for e, t in zip(y_test['event'], y_test['time'])],
+                         dtype=[('event', 'bool'), ('time', 'float')])
+
+print(f"X_train shape: {X_train.shape}")  
+print(f"X_test shape: {X_test.shape}")  
+
+# 构建 RSF 模型（使用最佳参数）
+best_model = RandomSurvivalForest(
+    n_estimators=1000,          # 增加树数量  
+    max_depth=3,               # 增加树深度  
+    min_samples_split=50,      # 进一步减少分裂约束  
+    min_samples_leaf=25,        # 进一步减少叶节点约束  
+    max_features=0.2,         # 关键：增加特征采样  
+    max_samples=0.6087,           # 适度增加样本采样  
+    random_state=42,  
+    n_jobs=-1  
+)  
+
+    
+# 拟合模型
+best_model.fit(X_train, y_train_struct)
+# 在训练集上预测
+preds_train = best_model.predict(X_train)
+c_index_train = concordance_index_censored(
+    y_train_struct['event'], y_train_struct['time'], preds_train
+)[0]
+print(f"Training C-index: {c_index_train:.4f}")
+
+# 在测试集上预测
+preds_test = best_model.predict(X_test)
+c_index_test = concordance_index_censored(
+    y_test_struct['event'], y_test_struct['time'], preds_test
+)[0]
+print(f"Testing C-index: {c_index_test:.4f}")
+
+
+
+#-------------------------------------
+#计算特征重要性
+from sklearn.inspection import permutation_importance  
+  
+def concordance_score(estimator, X, y):  
+    """自定义concordance index评分函数"""  
+    prediction = estimator.predict(X)  
+    result = concordance_index_censored(y['event'], y['time'], prediction)  
+    return result[0]  
+  
+print("计算特征重要性...")  
+perm_importance = permutation_importance(  
+    best_model,   
+    X_train,   
+    y_train_struct,  
+    n_repeats=10,  
+    random_state=42,  
+    scoring=concordance_score  
+)  
+  
+# 获取特征名称  
+feature_names = X_train.columns if hasattr(X_train, 'columns') else [f'feature_{i}' for i in range(X_train.shape[1])]  
+  
+# 创建特征重要性DataFrame  
+importance_df = pd.DataFrame({  
+    'feature': feature_names,  
+    'importance_mean': perm_importance.importances_mean,  
+    'importance_std': perm_importance.importances_std  
+}).sort_values('importance_mean', ascending=False)  
+  
+print("特征重要性排序:")  
+print(importance_df.head(15))
+
+
+
+#--------------------------
+#计算shap值
+import shap
+print(f"X_train shape: {X_train.shape}")  
+print("\n计算RSF模型的SHAP值...")  
+# 验证RSF模型类型    
+if not hasattr(best_model, 'predict'):    
+    raise ValueError("RSF模型必须有predict方法")    
+    
+# 创建背景数据集    
+background_size = min(50, len(X_train))    
+background_data = X_train.iloc[:background_size]    
+    
+# 使用通用Explainer，RSF的predict方法返回风险评分    
+explainer = shap.Explainer(best_model.predict, background_data)    
+    
+# 计算SHAP值    
+sample_size = min(273, len(X_train))    
+X_train_sample = X_train.iloc[:sample_size]    
+shap_values = explainer(X_train_sample)    
+    
+print(f"SHAP值计算完成，样本数量: {sample_size}")    
+print(f"SHAP值形状: {shap_values.values.shape}")    
+    
+# 可选：绘制SHAP图    
+shap.summary_plot(shap_values, X_train_sample)
+
+
+#--------------------------------
+#特征依赖图
+for i, feature_name in enumerate(feature_names):  
+    plt.figure(figsize=(8, 6))  
+      
+    # 获取特征值和对应的SHAP值  
+    feature_values = X_train_sample.iloc[:, i]  
+    shap_vals = shap_values.values[:, i]  
+      
+    # 绘制散点图  
+    plt.scatter(feature_values, shap_vals, alpha=0.6, s=20)  
+    plt.xlabel(f'{feature_name}')  
+    plt.ylabel(f'SHAP values for {feature_name}')  
+    plt.title(f'SHAP dependence plot: {feature_name}')  
+    plt.grid(True, alpha=0.3)  
+    plt.tight_layout()  
+    plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

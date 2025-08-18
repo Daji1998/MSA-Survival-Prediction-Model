@@ -1,0 +1,248 @@
+#----------------
+#导入库
+import optuna
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import KFold
+from sksurv.svm import FastSurvivalSVM
+from sksurv.metrics import concordance_index_censored
+from sklearn.model_selection import train_test_split
+
+#---------------------
+#全文件导入数据分割
+file_path = r'C:\Users\dong\Desktop\dataanalysis\test\selectdataimp2.csv'
+survdata = pd.read_csv(file_path)
+print(survdata.head())
+print(survdata.dtypes)
+print(survdata['statues'].value_counts())
+import sklearn
+import numpy as np
+X = survdata.drop(['statues', 'time2'], axis=1)
+y_time = survdata['time2']
+y_event = survdata['statues']
+X_train, X_test, y_time_train, y_time_test, y_event_train, y_event_test = train_test_split(
+    X, y_time, y_event,
+    test_size=0.3,
+    random_state=42,
+    stratify=y_event  # 按是否发生事件分层抽样
+)
+
+# 组合为 dataframe（后面交叉验证中容易处理）
+y_train = pd.DataFrame({'time': y_time_train, 'event': y_event_train})
+y_test = pd.DataFrame({'time': y_time_test, 'event': y_event_test})
+
+print(f"X_train shape: {X_train.shape}")
+print(f"X_test shape: {X_test.shape}")
+print(f"y_train shape: {y_train.shape}")
+print(f"y_test shape: {y_test.shape}")
+
+#--------------------------------------
+#筛选变量导入及分割
+file_path = r'C:\Users\dong\Desktop\dataanalysis\test\selectdataimp.csv'
+survdata = pd.read_csv(file_path) 
+  
+# 筛选指定的9个特征  
+feature_columns = [ 'FrequentFalls', 'PathologicalSigns',   
+                    'AOscore', 'NLR', 'AidWalking', 'Pscore','VB9','statues', 'time2']  
+top9 = survdata[feature_columns]
+print(top9.head())
+X = top9.drop(['statues', 'time2'], axis=1)
+y_time =  top9['time2']
+y_event =  top9['statues']
+X_train, X_test, y_time_train, y_time_test, y_event_train, y_event_test = train_test_split(
+    X, y_time, y_event,
+    test_size=0.3,
+    random_state=42,
+    stratify=y_event)  # 按是否发生事件分层抽样
+
+
+# 组合为 dataframe（后面交叉验证中容易处理）
+y_train = pd.DataFrame({'time': y_time_train, 'event': y_event_train})
+y_test = pd.DataFrame({'time': y_time_test, 'event': y_event_test})
+
+print(f"X_train shape: {X_train.shape}")  
+print(f"X_test shape: {X_test.shape}")  
+print(f"y_train shape: {y_train.shape}")  
+print(f"y_test shape: {y_test.shape}")
+
+#-------------------------------------
+#optuna寻参
+from sksurv.ensemble import GradientBoostingSurvivalAnalysis
+from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedKFold  
+y_train_struct = np.array(
+    [(bool(e), t) for e, t in zip(y_train['event'], y_train['time'])],
+    dtype=[('event', 'bool'), ('time', 'float64')]
+)
+def objective(trial):
+    # 定义超参数搜索空间
+    params = {
+        'learning_rate': trial.suggest_float('learning_rate',  0.01, 0.03, log=True),
+        'n_estimators': trial.suggest_int('n_estimators', 700, 1000),
+        'max_depth': trial.suggest_int('max_depth',  2, 3),
+        'min_samples_split': trial.suggest_int('min_samples_split', 40, 100),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 20, 40),
+        'subsample': trial.suggest_float('subsample', 0.5, 0.8),
+        'max_features': trial.suggest_categorical('max_features', [ 0.3, 0.5]),
+        'dropout_rate': trial.suggest_float('dropout_rate', 0.2, 0.4),
+        'tol': trial.suggest_float('tol', 1e-5, 1e-3, log=True),
+        'n_iter_no_change': trial.suggest_int('n_iter_no_change', 10, 20),
+    
+    }
+
+    # 初始化模型
+    model = GradientBoostingSurvivalAnalysis(
+        loss='coxph',
+        random_state=42,
+        **params
+    )
+
+    # 交叉验证
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)  
+    c_indices = []
+
+    for train_idx, val_idx in skf.split(X_train, y_train_struct['event']):
+        X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+        y_tr = y_train_struct[train_idx]
+        y_val = y_train_struct[val_idx]
+        
+        model.fit(X_tr, y_tr)
+        preds = model.predict(X_val)
+
+        c_index = concordance_index_censored(
+            y_val['event'], y_val['time'], preds
+        )[0]
+        c_indices.append(c_index)
+
+    return np.mean(c_indices)
+study = optuna.create_study(direction="maximize",sampler=optuna.samplers.TPESampler(seed=42))  # 我们希望最大化 C-index
+study.optimize(objective, n_trials=50)  # 进行 50 次调参试验
+print("最佳参数：", study.best_params)
+print("最佳得分：", study.best_value)
+
+
+#------------------------------------
+#拟合模型
+print(f"X_train shape: {X_train.shape}")
+print(f"X_test shape: {X_test.shape}")
+print(f"y_train_struct shape: {y_train.shape}")
+print(f"y_test_struct shape: {y_test.shape}")
+best_params = {  
+        'learning_rate':  0.02125841603006593,  
+        'n_estimators': 800,  
+        'max_depth':2,  
+        'min_samples_split': 70,  
+        'min_samples_leaf': 16,  
+        'subsample': 0.772269942177828,  
+        'max_features': 0.2,  
+        'dropout_rate': 0.3511102277086098,
+        'tol': 2.8681134821030064e-05,  
+        'n_iter_no_change': 12 
+    }  
+    
+final_model = GradientBoostingSurvivalAnalysis(**best_params,loss='coxph', random_state=42)
+final_model.fit(X_train, y_train_struct)
+y_test_struct = np.array(
+    [(bool(e), t) for e, t in zip(y_test['event'], y_test['time'])],
+    dtype=[('event', 'bool'), ('time', 'float64')]
+)
+preds_test = final_model.predict(X_test)
+preds_train = final_model.predict(X_train)
+
+c_index_train = concordance_index_censored(
+    y_train_struct['event'], y_train_struct['time'], preds_train
+)[0]
+print(f"TrainC-index: {c_index_train:.4f}")
+
+c_index_test = concordance_index_censored(
+    y_test_struct['event'], y_test_struct['time'], preds_test
+)[0]
+print(f"Test C-index: {c_index_test:.4f}")
+
+#-------------------------
+#AUC曲线
+from sksurv.metrics import cumulative_dynamic_auc  
+# 定义评估的时间点（替换 your_y_test 为您的测试集生存数据）  
+times = np.percentile(y_train_struct["time"], np.linspace(5, 95, 15))    
+
+
+# 计算时间依赖的 AUC（替换 your_y_train 和 your_y_test）  
+auc_scores, mean_auc = cumulative_dynamic_auc(y_train_struct, y_test_struct, preds_test, times)  
+plt.clf()   
+# 绘制 AUC 曲线  
+plt.plot(times, auc_scores, marker="o", label=f"GBSA (mean AUC = {mean_auc:.3f})")    
+plt.axhline(mean_auc, linestyle="--")    
+plt.xlabel("time")    
+plt.ylabel("time depandence AUC")    
+plt.legend()    
+plt.grid(True)
+plt.show()
+# 为训练集计算时间依赖的AUC  
+auc_scores_train, mean_auc_train = cumulative_dynamic_auc(y_train_struct, y_train_struct, preds_train, times)  
+  
+# 绘制训练集AUC曲线  
+plt.plot(times, auc_scores_train, marker="s", label=f"GBSA Train (mean AUC = {mean_auc_train:.3f})")  
+plt.plot(times, auc_scores, marker="o", label=f"GBSA Test (mean AUC = {mean_auc:.3f})")  
+plt.axhline(mean_auc_train, linestyle="--", alpha=0.7)  
+plt.axhline(mean_auc, linestyle="--", alpha=0.7)  
+plt.xlabel("time")  
+plt.ylabel("time dependence AUC")  
+plt.legend()  
+plt.grid(True)  
+plt.show()
+
+#-------------------------------
+#计算shap值
+print(f"X9_train shape: {X_train.shape}") 
+print("\n计算SHAP值...")  
+  
+try:  
+    # 验证模型类型  
+    if not hasattr(final_model, 'predict'):  
+        raise ValueError("模型必须有predict方法")  
+      
+    # 创建背景数据集  
+    background_size = min(50, len(X_train))  
+    background_data = X_train  
+      
+    # 使用通用Explainer  
+    explainer = shap.Explainer(final_model.predict, background_data)  
+      
+    # 计算SHAP值  
+    sample_size = min(273, len(X_train))  # 减少样本量以提高计算效率  
+    X_train_sample = X_train.iloc[:sample_size]  
+    shap_values = explainer(X_train_sample)  
+      
+    print(f"SHAP值计算完成，样本数量: {sample_size}")  
+    print(f"SHAP值形状: {shap_values.values.shape}")  
+      
+except Exception as e:  
+    print(f"SHAP计算失败: {e}")  
+    print("建议使用置换重要性作为替代方法")
+
+shap.summary_plot(shap_values, X_train_sample)
+shap.summary_plot(shap_values, X_train_sample,plot_type="bar")
+
+#-----------------------------------
+#Brier Score  计算
+from sksurv.metrics import brier_score  
+# 计算不同时间点的Brier Score  
+# 1. 使用训练好的模型获取生存函数  
+survival_functions = final_model5.predict_survival_function(X9_test)  
+  
+# 2. 计算生存概率  
+times = np.percentile(y_train["time"], np.linspace(5, 95, 15))  
+survival_probs = np.array([[fn(t) for t in times] for fn in survival_functions])  
+  
+# 3. 计算 Brier Score  
+times_eval, brier_scores = brier_score(y_train_struct, y_test_struct, survival_probs, times)  
+print(brier_scores)  
+# 4. 可视化  
+plt.figure(figsize=(10, 6))  
+plt.plot(times_eval, brier_scores, marker='o', label='Brier Score')  
+plt.xlabel('Time')  
+plt.ylabel('Brier Score')  
+plt.title('Time-dependent Brier Score')  
+plt.legend()  
+plt.grid(True)  
+plt.show()
