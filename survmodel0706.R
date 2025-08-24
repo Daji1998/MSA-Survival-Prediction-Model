@@ -1,26 +1,3 @@
-library(ggpubr)
-library(corrplot)
-library()
-library(caret)
-library(CBCgrps)
-library(tidyverse)
-library(rms)
-library(pROC)
-library(mice)
-library(zoo)
-library(VIM)
-library(timeROC)
-library(survivalROC)
-library(dplyr)
-library(forestmodel)
-library(survival)
-library(survminer)
-library(autoReg)
-library(ggsci)
-library(forestplot)
-library(forestploter)
-library(ggprism)
-getwd()
 data <- read.csv("all_data_raw.csv")
 table(is.na(data))
 head(data)
@@ -78,28 +55,7 @@ ggsurvplot(fit,data = data, pval = T,conf.int = T,conf.int.style="ribbon",
            censor.shape = 3)
 surv_median(fit)
 
-#折线图
-data <- read.csv("featureselect.csv")
-str(data)
-ggplot(data, aes(x = features, y = Cindex)) +
-  geom_line(color = "#1f77b4", size = 1) +
-  geom_point(color = "#1f77b4", size = 2) +
-  scale_x_reverse(breaks = seq(35, 1, by = -2)) +  # 横轴从35到1
-  geom_hline(yintercept = 0.75, linetype = "dashed", color = "#ec0000", size = 0.8) +  # 添加横线
-  labs(x = "Number of Features", y = "C-index", title = "C-index vs. Number of Features") +
-  theme_prism(base_size = 14)
-point11 <- subset(data, features == 11)
-ggplot(data, aes(x = features, y = Cindex)) +
-  geom_line(color = "#1f77b4", size = 1) +
-  geom_point(color = "#1f77b4", size = 2) +
-  scale_x_reverse(breaks = seq(35, 1, by = -2)) +
-  geom_hline(yintercept = 0.75, linetype = "dashed", color = "#ec0000", size = 0.8) +
-  # 添加注释点和文字
-  geom_point(data = point11, aes(x = features, y = Cindex), color = "#ec0000", size = 3) +
-  geom_text(data = point11, aes(label = round(Cindex, 3)), 
-            vjust = -1, hjust = 0.5, color = "#ec0000", size = 4) +
-  labs(x = "Number of Features", y = "C-index", title = "C-index vs. Number of Features") +
-  theme_prism(base_size = 14)
+
 ##单因素.多因素Cox回归分析----
 str(data)
 names(data)
@@ -134,12 +90,6 @@ cox_fit2 <- coxph(Surv(time, event) ~
                   data = data1)
 summary(cox_fit2)
 
-panels <- list(
-  forest_panel(width = 0.2, display = ~variable),
-  forest_panel(width = 0.3, display = ~estimate),
-  forest_panel(width = 0.6, item = "forest"),  # 主图更宽
-  forest_panel(width = 0.1, item = "vline", line_x = 1)  # 中心线
-)
 
 forest_model(cox_fit2,format_options = forest_model_format_options(
   colour = "#ec0000",
@@ -877,4 +827,5 @@ ggplot(df_pred, aes(x = riskscore, y = yhat)) +
   theme_bw(base_size = 14) +
   theme(panel.grid.major = element_blank(),  # 移除主网格线
         panel.grid.minor = element_blank())  # 移除次网格线
+
 
